@@ -597,6 +597,45 @@ def test_reset_for_tests_clears_observer_registration() -> None:
     assert received == []
 
 
+def test_reset_for_tests_clears_count_persist_hook() -> None:
+    """
+    ``reset_for_tests`` clears the count hook, not just the observer.
+
+    A surviving hook keeps writing through ``session_live_state``'s
+    unchanged-count dedupe, so the next test to wire a store and
+    publish the same count has its first write silently dropped and
+    asserts against an empty store — an order-dependent failure in a
+    test that never touched this module.
+    """
+    counts: list[tuple[str, int]] = []
+
+    def _hook(conv_id: str, count: int) -> None:
+        """Record every persisted count so we can assert call count."""
+        counts.append((conv_id, count))
+
+    pending_elicitations.set_count_persist_hook(_hook)
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.record_publish("conv_a", _elicit_event("elicit_1"))
+    assert counts == []
+
+
+def test_reset_for_tests_leaves_a_reregistered_count_hook_live() -> None:
+    """
+    Clearing the hook must not disable the setter for later tests.
+
+    A reset that left the module permanently hookless would mask
+    genuine count-persistence failures rather than fix the leak.
+    """
+    counts: list[tuple[str, int]] = []
+
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.set_count_persist_hook(
+        lambda conv_id, count: counts.append((conv_id, count))
+    )
+    pending_elicitations.record_publish("conv_a", _elicit_event("elicit_1"))
+    assert counts == [("conv_a", 1)]
+
+
 def test_lookup_returns_matching_elicitation() -> None:
     """
     :func:`lookup` returns ``(conversation_id, event)`` when the
