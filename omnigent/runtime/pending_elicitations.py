@@ -378,8 +378,14 @@ def reset_for_tests() -> None:
     from one test doesn't change the behavior of another. Not for
     production callers — there is no legitimate use case for
     wiping the index at runtime.
+
+    Clears both registered callbacks, not just the observer: a
+    surviving count hook keeps writing through
+    ``session_live_state``'s unchanged-count dedupe, which silently
+    suppresses a later test's first write.
     """
-    global _observer
+    global _observer, _count_persist_hook
     with _lock:
         _pending.clear()
     _observer = None
+    _count_persist_hook = None
