@@ -62,6 +62,7 @@ from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
+    LAUNCH_HANDLER_FAILED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -4975,12 +4976,29 @@ class HostProcess:
                 )
             # Register before queuing; keep the lifecycle lock as the first
             # await so launch/stop frames still acquire it in arrival order.
+            launch_fault: BaseException | None = None
             try:
                 async with self._runner_lifecycle_lock:
                     launch_result = await self._handle_launch(frame)
+            except Exception as exc:  # noqa: BLE001 — any fault still owes a result
+                # Every launch request owes the server one result. Staying
+                # silent makes it wait out the launch-result timeout, read the
+                # silence as a slow host rather than a failure, and fail the
+                # turn much later as a generically unavailable runner.
+                launch_result = self._launch_failed(
+                    frame,
+                    f"host failed to handle the launch request: {exc}",
+                    error_code=LAUNCH_HANDLER_FAILED_ERROR_CODE,
+                )
+                launch_fault = exc
             finally:
                 completion.set_result(None)
             await self._send_text(ws, encode_host_frame(launch_result))
+            if launch_fault is not None:
+                # Answered, but still unexplained: re-raise so the frame task
+                # records the traceback, which is the only diagnostic an
+                # unexpected fault leaves behind.
+                raise launch_fault
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
                 stop_result = await self._handle_stop(frame)
