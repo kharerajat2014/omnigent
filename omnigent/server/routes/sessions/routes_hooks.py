@@ -108,6 +108,15 @@ from omnigent.stores.permission_store import PermissionStore
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
 
+#: Phases whose ASK the server holds itself instead of returning the verdict.
+#: Returning ASK makes the native hook decide, and the permissive
+#: ``permission_mode`` values auto-approve it — so every phase a policy author
+#: can realistically gate belongs here. A phase left out of this set silently
+#: enforces nothing on a native session.
+_SERVER_HELD_ASK_PHASES: frozenset[Phase] = frozenset(
+    {Phase.TOOL_CALL, Phase.LLM_REQUEST, Phase.REQUEST, Phase.TOOL_RESULT}
+)
+
 
 def _create_route_decision_id(
     session_id: str,
@@ -914,11 +923,12 @@ def register_hooks_routes(
         # before the action proceeds (tool dispatch / LLM call / a native
         # session's user prompt via the UserPromptSubmit hook — which has no
         # ASK primitive of its own, so the server resolves ASK here).
-        if result.action == PolicyAction.ASK and phase in (
-            Phase.TOOL_CALL,
-            Phase.LLM_REQUEST,
-            Phase.REQUEST,
-        ):
+        # TOOL_RESULT gates later than those: the tool has already run, so the
+        # reviewer is releasing its output to the model, not authorizing the
+        # action. The park still blocks the turn because the PostToolUse hook
+        # waits on this response, but a decline cannot retract the side effect
+        # the tool already had — it withholds the output from the model.
+        if result.action == PolicyAction.ASK and phase in _SERVER_HELD_ASK_PHASES:
             if is_read_only:
                 # Read-only callers must not enter the ASK gate — parking
                 # creates an elicitation (a server-side mutation). Return
@@ -939,11 +949,7 @@ def register_hooks_routes(
                 async with _native_ask_gate_lock(session_id, deciding_policy):
                     engine = _build_engine()
                     result = await engine.evaluate(ctx, read_only=is_read_only)
-                    if result.action == PolicyAction.ASK and phase in (
-                        Phase.TOOL_CALL,
-                        Phase.LLM_REQUEST,
-                        Phase.REQUEST,
-                    ):
+                    if result.action == PolicyAction.ASK and phase in _SERVER_HELD_ASK_PHASES:
                         try:
                             approved = await _hold_native_ask_gate(
                                 request,

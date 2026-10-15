@@ -174,6 +174,18 @@ def _ask_for_bash(event: dict[str, Any]) -> dict[str, Any]:
     return {"result": "ALLOW"}
 
 
+def _ask_for_tool_result(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that requires human approval (ASK) before a result is released.
+
+    :param event: V0 event dict.
+    :returns: ASK on tool results, ALLOW on every other phase.
+    """
+    if event.get("type") != "tool_result":
+        return {"result": "ALLOW"}
+    return {"result": "ASK", "reason": "Approve releasing this output?"}
+
+
 # ── Helpers ─────────────────────────────────────────────────
 
 
@@ -873,6 +885,123 @@ async def test_tool_call_ask_forwards_popup_event_to_runner(
     resp = await evaluate
     assert resp.status_code == 200, resp.text
     assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_tool_result_ask_holds_gate_and_returns_allow_on_accept(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A TOOL_RESULT ASK holds the gate server-side and collapses to
+    ``POLICY_ACTION_ALLOW`` when the human releases the output.
+
+    Returning ASK here enforced nothing: ``PostToolUse`` has no ASK
+    branch, so the hook emitted no opinion and the output the policy
+    wanted reviewed reached the model untouched. If the park regresses,
+    the POST answers immediately and no card is ever published.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_tool_result")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_result_request("secrets: hunter2"),
+        )
+    )
+
+    elicitation_id = await drain
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await evaluate
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_tool_result_ask_returns_deny_on_decline(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A declined TOOL_RESULT ASK collapses to ``POLICY_ACTION_DENY``.
+
+    The tool already ran, so the DENY cannot retract its side effect —
+    it withholds the output from the model, which the ``PostToolUse``
+    hook renders as a policy-violation context note.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_tool_result")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_result_request("secrets: hunter2"),
+        )
+    )
+
+    elicitation_id = await drain
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "decline"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await evaluate
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+
+async def test_tool_result_ask_is_not_resolved_by_the_output_it_reviews(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The terminal-resolved fast path must not answer a TOOL_RESULT gate.
+
+    That path treats a mirrored result for a gated tool as proof the
+    human already answered in the native terminal, which holds only
+    before execution. A result gate is parked on the very output the
+    forwarder mirrors, so arming the correlation would let the output
+    under review resolve its own review — no human, no verdict. The
+    park stays unarmed because a TOOL_RESULT event carries the tool's
+    identity on ``request_data``, not on ``data``.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_tool_result")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_result_request("secrets: hunter2"),
+        )
+    )
+    elicitation_id = await drain
+
+    # The forwarder mirrors the reviewed output for the same tool.
+    sessions_routes._signal_terminal_resolved_harness_elicitation(session_id, "Bash", {})
+    await asyncio.sleep(0.05)
+    assert not evaluate.done(), "the output under review resolved its own approval gate"
+
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept"},
+    )
+    assert verdict.status_code == 202, verdict.text
+    resp = await evaluate
+    assert resp.json()["result"] == "POLICY_ACTION_ALLOW", resp.text
 
 
 # ── Concurrent ASK-gate serialization (parallel tool calls) ──

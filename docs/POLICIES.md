@@ -6,6 +6,11 @@ Policies are declarative gates that enforce rules on agent behavior. They evalua
 - **DENY** -- the action is blocked; the agent receives an error.
 - **ASK** -- the action is paused for user approval; approved becomes ALLOW, refused becomes DENY.
 
+An ASK on the `tool_result` phase pauses the turn the same way, but the tool has
+already run: approving releases its output to the model and refusing withholds
+it, and neither undoes the work the tool did. Gate the side effect itself on
+`tool_call`, and use `tool_result` to review what the model is about to read.
+
 Policies compose: multiple policies can be active at once. The engine evaluates them in declaration order. A DENY from any policy short-circuits the rest.
 
 ## Who configures policies

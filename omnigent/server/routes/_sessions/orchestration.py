@@ -2475,9 +2475,12 @@ async def _hold_native_ask_gate_impl(
 
     Used for any phase whose ASK must be resolved on the server rather
     than by a runner-side ``wait_for_user_approval`` park:
-    :attr:`Phase.TOOL_CALL` (the native ``PreToolUse`` hook gate) and
+    :attr:`Phase.TOOL_CALL` (the native ``PreToolUse`` hook gate),
     :attr:`Phase.REQUEST` (the user-message input gate, which has no
-    runner in the loop yet — see :func:`_evaluate_input_policy`).
+    runner in the loop yet — see :func:`_evaluate_input_policy`), and
+    :attr:`Phase.TOOL_RESULT` (the native ``PostToolUse`` hook gate,
+    where the reviewer releases an already-produced output to the
+    model rather than authorizing an action).
 
     Unlike the old ASK→``defer`` path, the gate lives on the server,
     so a permissive native ``permission_mode`` (``acceptEdits`` /
@@ -2497,7 +2500,9 @@ async def _hold_native_ask_gate_impl(
     :param data: The proto event ``data`` — for a tool call,
         ``{"name": "Bash", "arguments": {"command": "ls"}}``; for a
         request, the user ``message`` body
-        (``{"role": "user", "content": [...]}``).
+        (``{"role": "user", "content": [...]}``); for a tool result,
+        ``{"result": "<output>"}``. Previewed on the approval card, so
+        this is what the reviewer actually reads.
     :param engine: The policy engine, used to resolve the per-policy
         ``ask_timeout`` and to apply approved side effects.
     :param result: The composed ASK :class:`PolicyResult` — carries
@@ -2517,6 +2522,13 @@ async def _hold_native_ask_gate_impl(
         declines (``action == "decline"``). Callers should abort the
         turn rather than continuing with a DENY.
     """
+    # Tool identity arms the terminal-resolved fast path, which treats a
+    # mirrored result for this tool as proof the prompt was answered in the
+    # terminal. That holds pre-execution, but a TOOL_RESULT gate is parked on
+    # the very result that would be mirrored, so it must stay unarmed there —
+    # the output under review would otherwise resolve its own review. A
+    # TOOL_RESULT event's ``data`` carries no ``name``, which is what keeps it
+    # unarmed; do not enrich it from ``request_data``.
     tool_name = data.get("name")
     tool_input = data.get("arguments")
     params = ElicitationRequestParams(
