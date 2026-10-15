@@ -226,6 +226,25 @@ def test_post_tool_use_deny_maps_to_additional_context() -> None:
     assert hook_specific["additionalContext"] == "[Policy violation] Sensitive data in output"
 
 
+def test_post_tool_use_ask_is_surfaced_rather_than_silently_allowed() -> None:
+    """
+    A PostToolUse ASK reaching the hook fails closed as context.
+
+    The server parks TOOL_RESULT asks and answers a hard ALLOW/DENY, so
+    the hook should not see ASK. When it does, silence is the one wrong
+    answer: the result phase cannot block, so returning ``None`` would
+    hand the model the very output a policy wanted a human to review.
+    """
+    output = evaluation_response_to_hook_output(
+        "PostToolUse",
+        {"result": "POLICY_ACTION_ASK", "reason": "Approval required"},
+    )
+    assert output is not None, "an unresolved ASK released the output with no trace"
+    assert (
+        output["hookSpecificOutput"]["additionalContext"] == "[Policy violation] Approval required"
+    )
+
+
 def test_post_tool_use_allow_returns_none() -> None:
     """
     A PostToolUse ALLOW produces no output (nothing to inject).

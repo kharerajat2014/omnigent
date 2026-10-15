@@ -392,7 +392,9 @@ def evaluation_response_to_hook_output(
     layer may block (DENY) or demand approval (ASK); it must not silence
     the user's consent. For ``PostToolUse`` a ``DENY`` is surfaced as
     ``additionalContext`` because the tool result is already committed
-    — PostToolUse hooks cannot block.
+    — PostToolUse hooks cannot block. A stray ``ASK`` at that phase is
+    surfaced the same way: it is meant to be resolved server-side, and the
+    result phase has no harness decision left to defer to.
 
     For ``UserPromptSubmit`` the output uses the top-level ``decision`` /
     ``reason`` contract (not ``permissionDecision``): ``DENY`` → ``{"decision":
@@ -457,7 +459,12 @@ def evaluation_response_to_hook_output(
         return {"hookSpecificOutput": output}
 
     if hook_event == _POST_TOOL_USE:
-        if action == "POLICY_ACTION_DENY" and reason:
+        # ASK is resolved server-side (``_hold_native_ask_gate`` parks on the
+        # approval card and answers a hard ALLOW/DENY), so the hook should not
+        # see ASK here. If it somehow does, say so in context rather than
+        # returning ``None``: the result phase cannot block, so silence would
+        # hand the model an output a policy wanted a human to review.
+        if action in ("POLICY_ACTION_DENY", "POLICY_ACTION_ASK") and reason:
             return {
                 "hookSpecificOutput": {
                     "hookEventName": _POST_TOOL_USE,
