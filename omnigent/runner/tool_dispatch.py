@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import hashlib
 import json
 import logging
 import mimetypes
@@ -8027,6 +8028,25 @@ def _subagent_policy_failure_payload(payload: _JsonObject) -> _JsonObject:
     return {**payload, "output": _SUBAGENT_POLICY_FAILURE_OUTPUT}
 
 
+def _subagent_result_elicitation_id(payload: _JsonObject, output: str) -> str:
+    """
+    Derive this child result's stable approval id for ASK re-attachment.
+
+    A ``tool_result`` ASK parks the evaluate POST for a human, which outlives
+    this caller's request timeout: the drain gives up, re-queues the item, and
+    posts again. A stable id makes each retry re-attach to the parked approval
+    (and collect a verdict reached while nobody was waiting) instead of asking
+    the human once per retry. Keyed on the output too, so a replaced result is
+    a new decision rather than inheriting the old one's.
+
+    :param payload: Completed sub-agent inbox payload.
+    :param output: Raw child output text being gated.
+    :returns: An ``elicit_evaluate_``-prefixed id the server accepts.
+    """
+    fingerprint = hashlib.sha256(f"{_subagent_child_id(payload)}\x00{output}".encode()).hexdigest()
+    return f"elicit_evaluate_{fingerprint[:32]}"
+
+
 def _subagent_tool_result_policy_request(
     payload: _JsonObject,
     output: str,
@@ -8039,6 +8059,7 @@ def _subagent_tool_result_policy_request(
     :returns: JSON body for ``POST /policies/evaluate``.
     """
     return {
+        "_omnigent_elicitation_id": _subagent_result_elicitation_id(payload, output),
         "event": {
             "type": "PHASE_TOOL_RESULT",
             "data": {"result": output},
@@ -8051,7 +8072,7 @@ def _subagent_tool_result_policy_request(
                     "conversation_id": _subagent_child_id(payload),
                 },
             },
-        }
+        },
     }
 
 

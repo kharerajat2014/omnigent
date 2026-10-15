@@ -41,6 +41,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 from collections.abc import AsyncIterator, Callable
@@ -5711,6 +5712,40 @@ async def test_sys_read_inbox_applies_subagent_tool_result_policy(
     }
     assert expected_output in inbox_output
     assert blocked_output not in inbox_output
+
+
+def test_subagent_result_policy_request_carries_a_stable_reattach_id() -> None:
+    """
+    The child-result evaluation sends a stable approval re-attach id.
+
+    A ``tool_result`` ASK parks the POST for a human, which outlives this
+    caller's request timeout: the drain gives up and re-queues the item, so
+    without a stable id every retry would publish another approval card and
+    the human's verdict would never be collected. The id must therefore be
+    identical for a retry of the same result and different once the output
+    changes, since a replaced result is a new decision.
+    """
+    from omnigent.runner.tool_dispatch import _subagent_tool_result_policy_request
+
+    payload = {
+        "conversation_id": "conv_child_policy",
+        "agent": "worker",
+        "title": "phase-policy",
+    }
+
+    first = _subagent_tool_result_policy_request(payload, "SECRET_MARKER")
+    retry = _subagent_tool_result_policy_request(payload, "SECRET_MARKER")
+    replaced = _subagent_tool_result_policy_request(payload, "DIFFERENT_OUTPUT")
+
+    reattach_id = first["_omnigent_elicitation_id"]
+    # The server validates the shape before it will re-attach to it.
+    assert re.fullmatch(r"elicit_evaluate_[0-9a-f]{32}", reattach_id), reattach_id
+    assert retry["_omnigent_elicitation_id"] == reattach_id, (
+        "a retry minted a new id — the human would be asked once per retry"
+    )
+    assert replaced["_omnigent_elicitation_id"] != reattach_id, (
+        "a replaced result reused the prior decision's id"
+    )
 
 
 @pytest.mark.asyncio
