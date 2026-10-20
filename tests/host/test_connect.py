@@ -81,7 +81,6 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
-    classify_launch_refusal,
     decode_host_frame,
     encode_host_frame,
 )
@@ -7835,22 +7834,95 @@ async def test_launch_handler_failure_is_attributed_to_the_host(
     assert failure.attributes["error_impact"] == "blocking"
 
 
-async def test_launch_handler_failure_is_not_a_categorical_refusal() -> None:
-    """The fault may land after the spawn, so no runner-connect wait is skipped.
+async def test_launch_handler_fault_after_spawn_leaves_the_launch_unanswered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fault after the spawn must not tell the server no runner is coming.
 
-    ``classify_launch_refusal`` admits only failures where no runner can ever
-    connect and the server can describe the cause from its own state. An
-    arbitrary exception satisfies neither, so it stays generic rather than
-    cancelling a launch that may still arrive.
+    Every server reads a failed launch result as terminal and skips its
+    runner-connect wait, so answering "failed" here would fail a turn whose
+    runner still connects. Unanswered, the server's result timeout falls
+    through to that wait, which is the right outcome for an uncertain launch.
     """
-    assert (
-        classify_launch_refusal(
-            LAUNCH_HANDLER_FAILED_ERROR_CODE,
-            "host failed to handle the launch request: boom",
-            "/w",
-        )
-        is None
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    ws = _CollectingWs()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_fault_after_spawn",
+        binding_token="token_fault_after_spawn",
+        workspace=str(workspace),
+        session_id="session_fault_after_spawn",
     )
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "10"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _raise_after_spawn(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("fault after the runner was spawned")
+
+    # Raised once the runner is registered, i.e. a live runner may connect.
+    monkeypatch.setattr(host, "_watch_runner_connect", _raise_after_spawn)
+
+    try:
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            with pytest.raises(RuntimeError, match="fault after the runner was spawned"):
+                await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+
+        assert token_bound_runner_id(frame.binding_token) in host._runners, (
+            "the test must fault after the runner was spawned"
+        )
+        launch_results = [
+            result
+            for result in (decode_host_frame(raw) for raw in ws.sent)
+            if isinstance(result, HostLaunchRunnerResultFrame)
+        ]
+        assert launch_results == [], (
+            f"a post-spawn fault must not be answered as a failed launch, sent: {ws.sent}"
+        )
+        assert not host._spawned_launch_requests
+        assert all(
+            pending.done()
+            for futures in host._pending_runner_launches.values()
+            for pending in futures
+        )
+    finally:
+        _cleanup_host(host)
+
+
+async def test_launch_handler_fault_survives_a_lost_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel that drops the answer must not also drop the fault's traceback."""
+    host = _make_host_process()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_lost_answer",
+        binding_token="token_lost_answer",
+        workspace="/w",
+        session_id="session_lost_answer",
+    )
+
+    class _ClosedWs:
+        async def send(self, data: str) -> None:
+            raise ConnectionClosedError(None, None)
+
+    async def _raise(_frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        raise RuntimeError("the real launch fault")
+
+    monkeypatch.setattr(host, "_handle_launch", _raise)
+
+    # ConnectionClosed would be logged only at debug level as a dropped frame;
+    # the launch fault has to reach the frame task's traceback logging instead.
+    with pytest.raises(RuntimeError, match="the real launch fault"):
+        await host._dispatch_host_frame(_ClosedWs(), frame)  # type: ignore[arg-type]
 
 
 async def test_stop_frame_never_overtakes_launch(

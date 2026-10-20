@@ -1329,6 +1329,10 @@ class HostProcess:
         # Status queries wait for this runner's queued launch before deciding
         # that an unregistered runner is unknown.
         self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
+        # Launch request ids whose runner process has already been spawned. A
+        # handler fault after that point leaves the launch's outcome uncertain
+        # (the runner may still connect), so it must not be answered "failed".
+        self._spawned_launch_requests: set[str] = set()
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
@@ -2031,6 +2035,9 @@ class HostProcess:
                     frame,
                     f"failed to spawn runner: {exc}",
                 )
+        # From here a runner process exists and may connect on its own, so an
+        # unexpected fault can no longer be reported as a failed launch.
+        self._spawned_launch_requests.add(frame.request_id)
 
         if proc.poll() is not None:
             # The runner died before Popen returned — its actual error
@@ -5031,23 +5038,39 @@ class HostProcess:
             # Register before queuing; keep the lifecycle lock as the first
             # await so launch/stop frames still acquire it in arrival order.
             launch_fault: BaseException | None = None
+            launch_result: HostLaunchRunnerResultFrame | None = None
             try:
                 async with self._runner_lifecycle_lock:
                     launch_result = await self._handle_launch(frame)
-            except Exception as exc:  # noqa: BLE001 — any fault still owes a result
-                # Every launch request owes the server one result. Staying
-                # silent makes it wait out the launch-result timeout, read the
-                # silence as a slow host rather than a failure, and fail the
-                # turn much later as a generically unavailable runner.
-                launch_result = self._launch_failed(
-                    frame,
-                    f"host failed to handle the launch request: {exc}",
-                    error_code=LAUNCH_HANDLER_FAILED_ERROR_CODE,
-                )
+            except Exception as exc:  # noqa: BLE001 — a pre-spawn fault still owes a result
                 launch_fault = exc
+                if frame.request_id not in self._spawned_launch_requests:
+                    # No runner was spawned, so none can connect: answer
+                    # "failed". Staying silent makes the server wait out the
+                    # launch-result timeout, read the silence as a slow host,
+                    # and fail the turn much later as a generically
+                    # unavailable runner.
+                    launch_result = self._launch_failed(
+                        frame,
+                        f"host failed to handle the launch request: {exc}",
+                        error_code=LAUNCH_HANDLER_FAILED_ERROR_CODE,
+                    )
+                # Otherwise the runner may still connect. Every server reads a
+                # failed result as "no runner is coming" and skips its connect
+                # wait, so leave the launch unanswered; the result timeout
+                # falls through to that wait.
             finally:
+                self._spawned_launch_requests.discard(frame.request_id)
                 completion.set_result(None)
-            await self._send_text(ws, encode_host_frame(launch_result))
+            if launch_result is not None:
+                try:
+                    await self._send_text(ws, encode_host_frame(launch_result))
+                except ConnectionClosed:
+                    if launch_fault is None:
+                        raise
+                    # The answer was lost with the tunnel; the fault's
+                    # traceback is still the diagnostic worth recording.
+                    raise launch_fault from None
             if launch_fault is not None:
                 # Answered, but still unexplained: re-raise so the frame task
                 # records the traceback, which is the only diagnostic an
