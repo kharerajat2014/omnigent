@@ -46,12 +46,10 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
-# when the host's launch handler raised before any runner process was spawned,
-# so no runner can connect. A fault after the spawn is left unanswered instead,
-# because servers read every failed result as terminal and skip their
-# runner-connect wait. Unlike the codes above this is not a categorical
-# refusal: the server cannot describe the cause from its own state, so it stays
-# a generic failure whose host text is not echoed to every viewer.
+# when the host's launch handler raised before any runner process was spawned
+# (a post-spawn fault is not reported as a failure). Unlike the codes above
+# this is not a categorical refusal: the server cannot describe the cause from
+# its own state, so it stays a generic failure.
 LAUNCH_HANDLER_FAILED_ERROR_CODE = "launch_handler_failed"
 
 # Separates the summary of ``HostRunnerExitedFrame.error`` from the runner's log

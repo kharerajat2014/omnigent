@@ -7840,10 +7840,8 @@ async def test_launch_handler_fault_after_spawn_leaves_the_launch_unanswered(
 ) -> None:
     """A fault after the spawn must not tell the server no runner is coming.
 
-    Every server reads a failed launch result as terminal and skips its
-    runner-connect wait, so answering "failed" here would fail a turn whose
-    runner still connects. Unanswered, the server's result timeout falls
-    through to that wait, which is the right outcome for an uncertain launch.
+    Servers may terminate the launch or revoke its binding on a failed result,
+    so answering "failed" here could fail a turn whose runner still connects.
     """
     host = _make_host_process()
     host._auth_token_factory = lambda: "host-bootstrap-bearer"
@@ -7915,14 +7913,16 @@ async def test_launch_handler_fault_survives_a_lost_answer(
             raise ConnectionClosedError(None, None)
 
     async def _raise(_frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
-        raise RuntimeError("the real launch fault")
+        raise RuntimeError("the real launch fault") from PermissionError("denied")
 
     monkeypatch.setattr(host, "_handle_launch", _raise)
 
     # ConnectionClosed would be logged only at debug level as a dropped frame;
     # the launch fault has to reach the frame task's traceback logging instead.
-    with pytest.raises(RuntimeError, match="the real launch fault"):
+    with pytest.raises(RuntimeError, match="the real launch fault") as raised:
         await host._dispatch_host_frame(_ClosedWs(), frame)  # type: ignore[arg-type]
+    # The underlying cause is often the actual diagnostic; it must survive.
+    assert isinstance(raised.value.__cause__, PermissionError)
 
 
 async def test_stop_frame_never_overtakes_launch(

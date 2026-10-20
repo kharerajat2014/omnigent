@@ -1329,9 +1329,8 @@ class HostProcess:
         # Status queries wait for this runner's queued launch before deciding
         # that an unregistered runner is unknown.
         self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
-        # Launch request ids whose runner process has already been spawned. A
-        # handler fault after that point leaves the launch's outcome uncertain
-        # (the runner may still connect), so it must not be answered "failed".
+        # Launch request ids whose runner process has been spawned; a handler
+        # fault after that point is not reported as a failed launch.
         self._spawned_launch_requests: set[str] = set()
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
@@ -2035,8 +2034,7 @@ class HostProcess:
                     frame,
                     f"failed to spawn runner: {exc}",
                 )
-        # From here a runner process exists and may connect on its own, so an
-        # unexpected fault can no longer be reported as a failed launch.
+        # A runner now exists and may connect on its own.
         self._spawned_launch_requests.add(frame.request_id)
 
         if proc.poll() is not None:
@@ -5044,21 +5042,17 @@ class HostProcess:
                     launch_result = await self._handle_launch(frame)
             except Exception as exc:  # noqa: BLE001 — a pre-spawn fault still owes a result
                 launch_fault = exc
+                # Do not report failure after spawn: servers may terminate the
+                # launch or revoke its binding before the runner connects.
+                # Before the spawn no runner can connect, and staying silent
+                # would make the server wait out its result timeout as if the
+                # host were merely slow.
                 if frame.request_id not in self._spawned_launch_requests:
-                    # No runner was spawned, so none can connect: answer
-                    # "failed". Staying silent makes the server wait out the
-                    # launch-result timeout, read the silence as a slow host,
-                    # and fail the turn much later as a generically
-                    # unavailable runner.
                     launch_result = self._launch_failed(
                         frame,
                         f"host failed to handle the launch request: {exc}",
                         error_code=LAUNCH_HANDLER_FAILED_ERROR_CODE,
                     )
-                # Otherwise the runner may still connect. Every server reads a
-                # failed result as "no runner is coming" and skips its connect
-                # wait, so leave the launch unanswered; the result timeout
-                # falls through to that wait.
             finally:
                 self._spawned_launch_requests.discard(frame.request_id)
                 completion.set_result(None)
@@ -5068,9 +5062,8 @@ class HostProcess:
                 except ConnectionClosed:
                     if launch_fault is None:
                         raise
-                    # The answer was lost with the tunnel; the fault's
-                    # traceback is still the diagnostic worth recording.
-                    raise launch_fault from None
+                    # The answer was lost with the tunnel; the fault (re-raised
+                    # below, chain intact) is still the diagnostic to record.
             if launch_fault is not None:
                 # Answered, but still unexplained: re-raise so the frame task
                 # records the traceback, which is the only diagnostic an
