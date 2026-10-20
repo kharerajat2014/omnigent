@@ -32,7 +32,13 @@ reattach when the session moves to another host.
 
 **Agent terminal** (sessions whose harness has a terminal):
 
+Native subagents that share a parent's terminal show their work in chat and have
+no Chat/Terminal switcher. Open the parent session to use its terminal. Children
+with their own terminal retain the switcher.
+
 - Use the Chat/Terminal switcher in the session header.
+- Press ⌘/Ctrl+Alt+\ to toggle between Chat and Terminal view. The chord is
+  off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.
 - Choose Resume when the terminal shows as stopped.
 
@@ -40,6 +46,9 @@ reattach when the session moves to another host.
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
+- Press ⌘/Ctrl+Alt+T to open a shell of the remembered default type. The chord
+  is inert while the host is offline, the session is stranded, or a shell is
+  still being created, and it yields to a focused terminal or editor.
 - Select an open shell from the rail's shell list; close it from its tab.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
@@ -69,11 +78,23 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`
   kills the session's runner, so it fails under `verify-env run`; run it with
   plain `uv run pytest`.
+  Native child ownership and live output (opt-in, own environment):
+  `tests/e2e/test_codex_native_child_visibility_e2e.py`.
+  This uses real Codex credentials and holds a child command open while checking
+  the parent terminal and child chat; see the prerequisites in
+  `tests/harnesses/codex_native/forwarder/README.md`.
 - **`user-shell`:**
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_launches_and_opens`,
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
+- **`agent-terminal-view`, `user-shell`, keyboard:** no e2e coverage; component
+  tests `web/src/hooks/useViewModeToggleHotkey.test.tsx` and
+  `web/src/hooks/useNewShellHotkey.test.tsx` (`pnpm --dir web test`). Manually,
+  in a Claude or Codex session with the composer focused: press ⌘/Ctrl+Alt+\
+  twice and expect Terminal view, then Chat view; press ⌘/Ctrl+Alt+T and
+  expect a new shell tab to open and take focus. Repeat ⌘/Ctrl+Alt+T with the
+  shell focused and expect no second shell.
 - **`scrollback`, wheel:**
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_wheel_scroll_reaches_mouse_tracking_program`
 - **`scrollback`, touch:**
@@ -109,6 +130,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
+  injects the blocked event; it does not run a vendor CLI. For Claude's OSC
+  working/blocked status with an attached or closed viewer and the flag-off
+  fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
 
 ## Gotchas
 
@@ -116,6 +140,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   are different surfaces. A reattach or reconnect fix must be checked on both.
 - A host switch updates the host badge immediately. The badge changing is not
   proof the terminal reattached; look for the new host's terminal content.
+- The ⌘/Ctrl+Alt chords use ⌘ on macOS and Ctrl elsewhere, and they match the
+  physical key, so AltGr+T on an international layout must not open a shell.
 - Key bindings added for scrollback can change how full-screen harness terminals
   behave. After a scrollback change, drive the harness terminal itself, not only
   a plain shell.
@@ -123,6 +149,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   Use the tests' approach (the harness's own transcript or program input)
   instead of reading the page.
 - "Starting up" and "stopped" look similar. Starting up offers no Resume action;
-  stopped does. Wait past startup before calling a terminal stopped.
+  stopped does. Wait past startup before calling a terminal stopped. A
+  cloud-sandbox session stays in Starting up until its sandbox is ready, which
+  can take minutes.
 - Tests that need a harness-specific or opt-in environment skip quietly without
   it. Check that the test ran, not only that the suite passed.

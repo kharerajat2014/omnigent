@@ -764,6 +764,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         project,
+        false,
       ),
     );
   });
@@ -871,6 +872,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
     expect(resolveCreate).toBeTypeOf("function");
@@ -917,6 +919,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
   });
@@ -1127,6 +1130,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
 
@@ -2108,7 +2112,8 @@ describe("NewChatLandingScreen create flow", () => {
       '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
     );
     expect(fullNameRow).not.toBeNull();
-    expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
+    expect(fullNameRow).toHaveTextContent("GPT 5.6 Sol");
+    expect(fullNameRow).toHaveAttribute("title", "omnigent-openai/system.ai.gpt-5-6-sol");
     fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
       target: { value: "gpt sol" },
     });

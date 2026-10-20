@@ -58,7 +58,12 @@ import {
 } from "@/lib/workspacePanelPreferences";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
-import { readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import {
+  type DefaultWorkspaceTab,
+  isDefaultWorkspaceTab,
+  readInitialWorkspaceTab,
+  readPinnedWorkspaceTabs,
+} from "@/lib/workspaceTabPreferences";
 import {
   Dialog,
   DialogContent,
@@ -100,7 +105,7 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
-import { isTempConvId, useChatStore } from "@/store/chatStore";
+import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
 import { supportsSideChat } from "@/lib/sideChat";
 import {
   STARTING_GRACE_S,
@@ -111,7 +116,6 @@ import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
-import { FileViewer } from "./FileViewer";
 import {
   FileViewerContext,
   type FilePosition,
@@ -270,11 +274,21 @@ export function AppShell() {
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
   const pendingConversation = conversationId != null && serverConversationId == null;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
-  const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
+  const [mobileFileTarget, setMobileFileTarget] = useState<HTMLDivElement | null>(null);
+  const [rightRailTab, setRightRailTab] = useState<RightRailTab | null>(() =>
     conversationId
-      ? (readSessionWorkspaceState(conversationId).rightRailTab ?? readDefaultWorkspaceTab())
-      : "files",
+      ? (readSessionWorkspaceState(conversationId).rightRailTab ?? readInitialWorkspaceTab())
+      : null,
   );
+  const [openPanels, setOpenPanels] = useState<DefaultWorkspaceTab[]>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).openPanels ?? []) : [],
+  );
+  const selectRightRailTab = useCallback((next: RightRailTab | null) => {
+    setRightRailTab(next);
+    if (isDefaultWorkspaceTab(next) && !readPinnedWorkspaceTabs().includes(next)) {
+      setOpenPanels((previous) => (previous.includes(next) ? previous : [...previous, next]));
+    }
+  }, []);
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on any other tab the FileViewer
   // is unmounted, so the 720 floor would just waste horizontal space. Both
@@ -298,18 +312,9 @@ export function AppShell() {
     if (canvasMode) setSidebarPeek(false);
   }, [canvasMode]);
 
-  // The settings nav lives INSIDE the sidebar, and its "Back" row is the only
-  // way off the settings page. A collapsed sidebar therefore strands the user
-  // there — the row is still in the DOM but clipped and inert. So entering
-  // /settings pins the sidebar open (and drops any peek, which is a transient
-  // hover card, not somewhere to read a settings page from), and leaving it
-  // restores whatever the sidebar was before, so a collapsed sidebar stays a
-  // preference rather than being silently undone by a trip to settings.
-  //
-  // The pin is only needed WHILE on the page, so restoring on exit cannot
-  // reintroduce the trap: by then the title-bar toggle is back and the Back row
-  // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
-  // stashes and restores the same state around the maximize flow.
+  // Desktop settings need the sidebar's Back row. Mobile section links keep
+  // the drawer state chosen by navigation; the header can reopen the menu.
+  // Restore the prior sidebar preference when leaving settings.
   const { inSettings } = useSettingsRoute();
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
@@ -321,7 +326,11 @@ export function AppShell() {
         if (sidebarOpenBeforeSettingsRef.current === null) {
           sidebarOpenBeforeSettingsRef.current = wasOpen;
         }
-        return true;
+        return (
+          !isMobileViewport() ||
+          location.pathname.replace(/\/$/, "") === rebasePath("/settings") ||
+          wasOpen
+        );
       });
       setSidebarPeek(false);
       return;
@@ -332,7 +341,7 @@ export function AppShell() {
       setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
       sidebarOpenBeforeSettingsRef.current = null;
     }
-  }, [inSettings, setSidebarOpen]);
+  }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
 
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
@@ -937,6 +946,8 @@ export function AppShell() {
     () =>
       ({
         files: showFilesPanel,
+        "content-search":
+          showFilesPanel && isFeatureEnabled(serverInfo, "workspace_content_search"),
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
@@ -954,13 +965,18 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel],
+    [showFilesPanel, serverInfo],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
+  const initialWorkspaceTab = readInitialWorkspaceTab();
+  const fallbackWorkspaceTab =
+    initialWorkspaceTab !== null && railTabsAvailable[initialWorkspaceTab]
+      ? initialWorkspaceTab
+      : (readPinnedWorkspaceTabs().find((tab) => railTabsAvailable[tab]) ?? null);
   // Mount the relay at the always-present shell level (not BrowserPane, which
   // only mounts while its tab is selected) so it's listening before the first
   // browser_navigate. No-op outside Electron / with no conversation.
@@ -1055,6 +1071,8 @@ export function AppShell() {
             chat.sessionStatus,
             chat.queuedMessages,
             readAlwaysSteer(),
+            false,
+            holdsInitialDraft(chat),
           )
         ) {
           chat.enqueueMessage(text, files);
@@ -1152,7 +1170,8 @@ export function AppShell() {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
       setRightPanelOpenImmediately(false);
-      setRightRailTab("files");
+      setRightRailTab(null);
+      setOpenPanels([]);
       setSelectedFilePath(null);
       setOpenFiles([]);
       autoFocusTerminalKeyRef.current = null;
@@ -1187,9 +1206,9 @@ export function AppShell() {
       rightRailTab === "subagents" &&
       rootSessionId !== null &&
       previousRootSessionIdRef.current === rootSessionId;
-    let nextTab: RightRailTab =
+    let nextTab: RightRailTab | null =
       persisted.rightRailTab ??
-      (keepAgentsAcrossTreeNavigation ? "subagents" : readDefaultWorkspaceTab());
+      (keepAgentsAcrossTreeNavigation ? "subagents" : readInitialWorkspaceTab());
     // Browser is a dynamic soft-tab mode, not a permanent nav destination.
     // A stale pre-soft-tab selection (or a closed last tab) restores to the
     // configured static default instead of showing an unselected rail.
@@ -1200,7 +1219,7 @@ export function AppShell() {
         persisted.selectedBrowserId === undefined ||
         !persistedBrowsers.includes(persisted.selectedBrowserId))
     ) {
-      nextTab = readDefaultWorkspaceTab();
+      nextTab = readInitialWorkspaceTab();
     }
 
     // Restore the open file tabs from the per-session store, then merge the
@@ -1240,6 +1259,15 @@ export function AppShell() {
       setSubagentsPanelOpen(isMobileViewport());
     }
     setRightRailTab(nextTab);
+    const restoredPanels = persisted.openPanels ?? [];
+    setOpenPanels(
+      isDefaultWorkspaceTab(nextTab) &&
+        !readPinnedWorkspaceTabs().includes(nextTab) &&
+        !nextSelected &&
+        !restoredPanels.includes(nextTab)
+        ? [...restoredPanels, nextTab]
+        : restoredPanels,
+    );
 
     // Restore the rail open-state for this session. A deep link / reload that
     // carries a workspace signal — a file to open (?file=) or a comment to
@@ -1288,17 +1316,38 @@ export function AppShell() {
   // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
     setRightRailTab((tab) => {
+      const fallbackTab =
+        openPanels.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab;
       // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
       // gated nav tab — always valid, and never a fallback target.
+      if (tab === null) return fallbackTab;
       if (tab === "sidechat") return tab;
+      if (tab === "content-search" && serverInfo === "loading") return tab;
       if (railTabsAvailable[tab]) return tab;
-      return (
-        (["files", "changes", "github", "subagents", "browser"] as const).find(
-          (candidate) => railTabsAvailable[candidate],
-        ) ?? tab
-      );
+      return fallbackTab;
     });
-  }, [railTabsAvailable, rightRailTab]);
+  }, [railTabsAvailable, rightRailTab, openPanels, fallbackWorkspaceTab, serverInfo]);
+
+  // Closing a file must not reveal an unpinned scope that was never opened.
+  useEffect(() => {
+    if (
+      selectedFilePath === null &&
+      selectedTerminalKey === null &&
+      isDefaultWorkspaceTab(rightRailTab) &&
+      !readPinnedWorkspaceTabs().includes(rightRailTab) &&
+      !openPanels.includes(rightRailTab)
+    )
+      setRightRailTab(
+        openPanels.filter((tab) => railTabsAvailable[tab]).at(-1) ?? fallbackWorkspaceTab,
+      );
+  }, [
+    rightRailTab,
+    openPanels,
+    selectedFilePath,
+    selectedTerminalKey,
+    fallbackWorkspaceTab,
+    railTabsAvailable,
+  ]);
 
   // Selecting the current agent removes the panel query without changing sessions.
   useEffect(() => {
@@ -1314,10 +1363,10 @@ export function AppShell() {
     setFilesPanelOpen(false);
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
-    setRightRailTab("subagents");
+    selectRightRailTab("subagents");
     setRightPanelOpenImmediately(true);
     setSubagentsPanelOpen(isMobileViewport());
-  }, [conversationId, agentsPanelRequested, setRightPanelOpenImmediately]);
+  }, [conversationId, agentsPanelRequested, setRightPanelOpenImmediately, selectRightRailTab]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
@@ -1334,11 +1383,12 @@ export function AppShell() {
     if (!id) return;
     writeSessionWorkspaceState(id, {
       rightRailTab,
+      openPanels,
       openFiles,
       selectedFilePath,
       selectedTerminalKey,
     });
-  }, [rightRailTab, openFiles, selectedFilePath, selectedTerminalKey]);
+  }, [rightRailTab, openPanels, openFiles, selectedFilePath, selectedTerminalKey]);
 
   const handleFilesSortChange = useCallback((s: ChangedSort) => {
     setFilesPanelSort(s);
@@ -1406,7 +1456,6 @@ export function AppShell() {
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId, setRightPanelOpenAnimated],
   );
 
-  // Desktop and mobile viewers can both be mounted; each may own a draft.
   const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
   const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
     fileNavigationGuardsRef.current.add(guard);
@@ -1725,7 +1774,7 @@ export function AppShell() {
       setCommandPaletteOpen((prev) => !sessionSearch || !prev);
     },
   );
-  useNewSessionHotkey(!isEmbedded);
+  useNewSessionHotkey();
   useSettingsHotkey();
 
   // Mobile back button: close the open file and return to the files/changes
@@ -1807,8 +1856,8 @@ export function AppShell() {
   // per-tab file to stash and restore; switching tabs just closes any
   // open file to reveal the picked tab's scope list.
   const handleRightRailTabChange = useCallback(
-    (next: RightRailTab) => {
-      setRightRailTab(next);
+    (next: RightRailTab | null) => {
+      selectRightRailTab(next);
       if (selectedFilePath !== null) {
         setSelectedFilePath(null);
         setFileViewerCommentsOpen(false);
@@ -1820,7 +1869,19 @@ export function AppShell() {
         setSelectedTerminalKey(null);
       }
     },
-    [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
+    [selectedFilePath, selectedTerminalKey, clearFileViewerUrl, selectRightRailTab],
+  );
+  const closeWorkspacePanel = useCallback(
+    (tab: DefaultWorkspaceTab) => {
+      const remaining = openPanels.filter((panel) => panel !== tab);
+      setOpenPanels(remaining);
+      if (rightRailTab === tab) {
+        setRightRailTab(
+          remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab,
+        );
+      }
+    },
+    [openPanels, rightRailTab, fallbackWorkspaceTab, railTabsAvailable],
   );
 
   // Auto-open a Browser soft tab on a `navigate` action — agent-issued
@@ -2088,7 +2149,7 @@ export function AppShell() {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
-    setRightRailTab("github");
+    selectRightRailTab("github");
     setRightPanelOpenAnimated(true);
     if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
   }, [
@@ -2096,6 +2157,7 @@ export function AppShell() {
     terminalFirst,
     setPanelInitialKey,
     openGithubPanel,
+    selectRightRailTab,
     setRightPanelOpenAnimated,
   ]);
 
@@ -2180,6 +2242,10 @@ export function AppShell() {
   // the failed-suppression exactly like an in-flight send does.
   const launchPending =
     runnerLaunchedAt !== null && Date.now() - runnerLaunchedAt < STARTING_GRACE_S * 1000;
+  // A managed sandbox can take minutes to come up, past every grace here; until
+  // `ready` its session has no runner, so only the launch status says it is coming.
+  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
+  const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
   // Until the liveness row or session snapshot hydrates, a brand-new
   // session is indistinguishable from a stopped one — treat the unobserved
   // window as starting so the stopped UI can't flash during startup.
@@ -2211,6 +2277,7 @@ export function AppShell() {
     (sessionStatus !== "failed" || chatStatus === "streaming" || launchPending) &&
     (livenessRowPending ||
       launchPending ||
+      sandboxLaunching ||
       // terminal_pending is the runner's own "creating the PTY" signal,
       // accurate in the snapshot after a reload; gate on an alive-ish
       // liveness so a stale flag from a dead runner can't pin the spinner.
@@ -2553,7 +2620,7 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId && hasRailContent && (
+                {conversationId && (hasRailContent || selectedFilePath !== null) && (
                   <WorkspacePanel
                     conversationId={conversationId}
                     pending={pendingConversation}
@@ -2566,16 +2633,21 @@ export function AppShell() {
                     rightRailTab={rightRailTab}
                     tabListRef={workspaceTabListRef}
                     onRightRailTabChange={handleRightRailTabChange}
+                    openPanels={openPanels}
+                    onClosePanel={closeWorkspacePanel}
                     showFilesPanel={showFilesPanel}
                     showGithubTab={railTabsAvailable.github}
+                    showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}
-                    onBrowserTabOpened={revealRightPanel}
+                    onReveal={revealRightPanel}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}
                     rootSessionId={rootSessionId}
                     selectedFilePath={selectedFilePath}
                     filePosition={filePosition}
+                    mobileFileTarget={mobileFileTarget}
+                    onMobileFileClose={closeFileViewer}
                     openFiles={openFiles}
                     openFileViewer={openFileViewer}
                     onCloseFile={closeFile}
@@ -2683,22 +2755,7 @@ export function AppShell() {
                   <PullRequestPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
-              {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
-              {serverConversationId && selectedFilePath !== null && (
-                <div className="md:hidden">
-                  <FileViewer
-                    viewport="mobile"
-                    open
-                    conversationId={serverConversationId}
-                    path={selectedFilePath}
-                    position={filePosition}
-                    onClose={closeFileViewer}
-                    onNavigateTo={openFileViewer}
-                    permissionLevel={permissionLevel}
-                    sort={filesPanelSort}
-                  />
-                </div>
-              )}
+              <div ref={setMobileFileTarget} className="md:hidden" />
             </CanvasWorkspace>
           </div>
           {conversationId && (

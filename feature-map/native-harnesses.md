@@ -23,6 +23,14 @@ implements them separately, so a fix for one harness does not reach the others.
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
+  A single-file tool row (Read, Write, Edit) shows its path as a dotted link;
+  clicking it opens that file in the workspace viewer without expanding the
+  row. Absolute paths open workspace-relative under the session root and
+  host-absolute outside it; they stay plain text until the root is known.
+  Shell commands and multi-file patches have no file link.
+- `working-status`: quiet work stays working; waiting for input is explained;
+  completion, interruption and process exit settle the indicator. A following
+  turn and reconnect must not leave a stale idle or working state.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups
   stay in that thread, and closing it leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
@@ -35,10 +43,14 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings (or its card's gear). One Startup configuration block shows Command,
   Environment, and Arguments, unmasked and read-only, with the selected host's source.
   Env wrappers are split into these fields, without a duplicate raw invocation.
-  Session and workspace config can add to or override these host defaults.
+  Sessions can add to or override these host defaults. Project config can
+  choose the default harness, but commands and arguments come only from user config.
   Other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
+- `codex-plugin-skills`: enabled Codex plugin skills remain selectable in both
+  web composers when marketplace inventory fails; disabled or uninstalled
+  cached plugins do not become invocable.
 
 - `mcp-tools`: expand a configured or plugin MCP server to probe its tools,
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
@@ -54,6 +66,13 @@ implements them separately, so a fix for one harness does not reach the others.
 configuration for model and effort, and send. Approval cards and the Terminal
 view appear in the session.
 
+**Working status:** watch the session's Chat indicator after sending from the
+new-session composer, an existing-session composer, or the agent terminal.
+Switch Terminal → Chat, close/reopen the viewer, and reload during quiet work.
+Repeat the Chat and header-menu Terminal paths at phone width. A locally
+launched `omnigent claude` session is a separate launch path; inspect its linked
+Chat session as well as the local terminal.
+
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
 
@@ -64,6 +83,11 @@ the advertised session and saved-rule choices.
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
 list or plugin.
+
+**Codex plugin completion:** in an existing Codex Chat session, or on the
+landing page with a Codex host/workspace selected, type `$<skill-name>` and
+select its namespaced suggestion. See the
+[Composer recipe](./composer.md#driving-it-with-the-repro-environment).
 
 **MCP tools:** Settings → Harnesses → configured harness card (or gear),
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
@@ -110,6 +134,20 @@ mock model there. For any other harness, install its CLI, sign in with a test
 account, and run its tests with plain `uv run pytest` instead, or follow its dev
 skill when one is linked above.
 
+Claude Code also reads machine-wide managed settings outside `CLAUDE_CONFIG_DIR`.
+Native Claude mock fixtures reject a managed `ANTHROPIC_BASE_URL` pointing away
+from the mock before creating the session, including in workflow-owned runs.
+This is a blocked prerequisite, not a skipped or passing acceptance check. Use
+a clean container or CI runner without that override; do not edit machine policy.
+The render-parity journey additionally requires each web and terminal prompt
+marker to reach the mock under the configured model. A rendered reply or a
+background request alone is not routing evidence.
+
+Apply the shared [harness acceptance checklist](./harness-acceptance.md) to
+affected harnesses and entry points. The matrix above locates existing tests;
+it is not a coverage verdict. Use the existing harness bench where applicable
+and record each harness's missing or blocked checks, not just its passing ones.
+
 ```sh
 verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"
@@ -133,6 +171,48 @@ the extra fields. Resolver and raw-tunnel checks:
 `tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
 
 Cross-harness journeys:
+
+- **`working-status`, Claude (component and real-process checks):** run with
+  plain `uv run --no-sync pytest`, `--reruns 0 -n 0`:
+  `tests/runner/test_resource_registry.py::test_claude_program_status_real_launch_and_fallback`,
+  `tests/runner/test_resource_registry.py::test_program_status_respects_flag_and_claude_role`,
+  `tests/runner/test_resource_registry.py::test_queued_turn_republishes_running_after_stop`,
+  `tests/runner/test_resource_registry.py::test_failed_hook_does_not_republish_stale_running_status`,
+  `tests/harnesses/claude_native/test_claude_native_program_status.py`, and
+  `tests/harnesses/claude_native/test_claude_native_status_file.py`.
+  The launch matrix uses a scripted protocol peer through real tmux, with and
+  without the available OS sandbox. It covers OSC on, an enabled non-emitting
+  peer and flag off; quiet work, blocked reasons, completion/error, child
+  isolation, reconnect/forwarded-idle replay, fallback, and exit. The concurrency
+  tests pause real file reads; they are not elapsed-time or live-Claude canaries.
+  Legacy-file and role-gating results do not prove other vendor CLIs ran.
+- **`working-status`, Claude (real CLI and browser):** requires Claude Code
+  2.1.295+ for OSC. In an isolated host/runner, leave `OMNIGENT_FEATURES` unset
+  to exercise the enabled default, restart and launch a fresh session. Do not set
+  `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, which also suppresses program status.
+  Confirm OSC negotiation and emitted Claude root state in the terminal evidence;
+  flag-on alone does not prove the OSC path was exercised. Run the matrix's
+  Claude render-parity test through `verify-env run` for existing-composer and
+  embedded-terminal turns, final output, idle settlement and duplicate checks.
+  This test does not cover quiet work, interruption or the new-session composer.
+  For each remaining entry point above, hold a harmless tool operation open
+  beyond the pane idle threshold, observe working with the viewer closed, then
+  open/reopen it and reload. Trigger a permission/question prompt and confirm
+  the blocked explanation points to the input surface; answer and finish.
+  Separately interrupt active work and complete a follow-up; queue a follow-up
+  across completion and check it runs once. Compare Chat with the session REST
+  status and keep a recording plus terminal transcript. Restart the isolated
+  runner and repeat with `OMNIGENT_FEATURES=-claude_osc_status` (the kill
+  switch), and separately with a pre-2.1.295 CLI under the default. Record each version, gate, sandbox and surface separately.
+  Machine-managed Claude provider settings can prevent the scripted endpoint
+  from being used: report that blocker or use an isolated test container.
+  Do not change machine policy to obtain a passing run.
+- **`working-status`, browser presentation only:** the existing
+  `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
+  injects a status event through the real server to check the blocked hint.
+  It does not launch Claude or verify OSC production. Shared terminal launch
+  and cleanup checks, including Codex-role and auxiliary-shell controls, are
+  in [Terminals](./terminals.md); they do not establish full harness acceptance.
 
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
@@ -191,12 +271,17 @@ Cross-harness journeys:
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`,
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_pick_recreates_closed_terminal`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_combined_model_and_reset_uses_target_default`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_effort_reset_survives_next_turn`.
   These own their environment: run with plain `uv run pytest`. They drive a
   real Codex TUI and REST session settings, checking the outgoing Responses
   effort, native settings, private config, and session state. Only the model
-  replies are mocked; models absent from the installed CLI are skipped.
+  replies are mocked; models absent from the installed CLI are skipped. Set
+  `OMNIGENT_TEST_CODEX_STANDARD_MODEL` (low..xhigh), `OMNIGENT_TEST_CODEX_EXTENDED_MODEL`
+  (max/ultra), and `OMNIGENT_TEST_CODEX_SWITCH_MODEL` (a different default) to
+  substitute models; a configured model the installed catalog lacks fails
+  instead of skipping, and replies stay on the local mock server.
   Existing-session cases also require the picker to show the applied effort
   when an unsupported request clamps back to the already active native value.
   Concurrent runner controls are covered by
@@ -244,9 +329,17 @@ Cross-harness journeys:
   An older server resets the previous model first, even with an updated runner;
   its default is then inherited if the target supports it. On older servers,
   switch models first and select Default as a separate action afterward.
-  While a connected runner is still starting Codex and has no loaded bridge,
-  live settings return a retryable 503 and retain the previous selection.
-  Retry once the terminal is ready; fully offline and silent saves remain deferred.
+  On a connected runner, live settings recreate an idle-reaped Codex pane and
+  wait up to 15 seconds for startup to publish its bridge. An unloaded saved
+  thread is resumed once before retrying a rejected update. Overlapping picks
+  retain their apply order, including while recovery is in progress
+  (`tests/server/integration/test_codex_model_change_after_idle_reap.py`).
+  A refused connection to an owned backend whose process has exited replaces
+  that exact launch once within the same readiness budget, then confirms the
+  settings RPC. A replacement backend, live process, authentication refusal,
+  or failure after sending settings is not replayed.
+  Failed startup or resume returns a retryable 503 and retains the previous
+  selection; fully offline and silent saves remain deferred.
   An older server keeps such a refused change, so the updated runner applies it
   on the next turn; an older runner keeps it itself, so the updated server keeps
   it too. A hung connect fails after five seconds; a hung update is unconfirmed,
@@ -282,6 +375,14 @@ Cross-harness journeys:
   retain their endpoint; history, model, effort and permissions survive.
   `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_resumes_with_launch_provider`
   covers the CLI resume call site with configured and unpinned launches.
+- **`resume`, Codex `/new` followed by Stop session and a new message:**
+  `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
+  (own environment, real server, host, runner, Codex and tmux; local model replies)
+  starts a conversation, runs `/new` in the native terminal, and verifies the
+  rotated conversation before stopping its runner. A chat message relaunches
+  the session, then a terminal message verifies the reattached TUI. It covers
+  retained bridge state and an absent bridge directory. Machine-wide Codex
+  managed settings require an isolated container for the local model endpoint.
 - **`chat-render`, `steer`, per harness:** use the matrix.
 - **`chat-render`, Claude shell commands from the web composer:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`
@@ -292,12 +393,26 @@ Cross-harness journeys:
   covers the real CLI and transcript forwarder through the repro environment.
   It requires Claude Code and tmux; machine-managed Claude settings need an
   isolated container for the scripted model endpoint.
+  If shell mode or the prompt-history search still occupies Claude Code's input
+  box after Omnigent tries to dismiss it with Escape, the web message is refused
+  with a notice to open the terminal, dismiss it, and resend. No message text is
+  typed into the pane.
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear`
+  covers the refusal with a fake tmux (plain `uv run pytest`);
+  `tests/e2e_ui/messages/test_claude_native_refused_delivery_persistence.py::test_claude_refused_message_survives_reload`
+  (own environment; a scripted stand-in for the Claude TUI and real tmux) checks
+  that the refused input is still shown after a reload.
 - **`chat-render`, Claude shell commands from the agent terminal:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_terminal_shell_commands_keep_their_user_turns`
   replays terminal-origin records in the built SPA at desktop and phone widths.
   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
   prompt must remain a separate user turn outside the assistant's folded work,
   including after reload. This browser contract does not launch the Claude CLI.
+- **`codex-plugin-skills`:** use the
+  [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
+  real CLI catalog regression and recorded browser journey across both
+  composers. No model call is needed for discovery; this is separate from
+  Settings plugin inventory and vendor-terminal completion.
 - **`skill-contents`:** run `tests/host/test_skill_content.py`,
   `tests/server/routes/test_skill_content.py`, and the real-host test
   `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain
@@ -394,6 +509,9 @@ Cross-harness journeys:
 
 ## Gotchas
 
+- For user/project defaults and startup-argument precedence, use
+  [Preferences and config defaults](./preferences.md). The read-only Startup
+  configuration and plugin inventory do not expose shared-preference controls.
 - A change to shared native-harness behavior (cleanup, idle handling,
   approvals, sign-in state, resume) must be checked on every harness it claims
   to cover. List the harnesses you actually drove; "all harnesses" means all

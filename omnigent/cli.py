@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import errno
+import hashlib
 import json
 import logging
 import os
@@ -54,10 +57,12 @@ from omnigent.cli_native import register_native_commands as _register_native_com
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
+    _ignored_project_harness_keys,
     _merge_effective_config,
     global_config_path,
     load_global_config,
     load_local_config,
+    resolve_effective_config,
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.daemon_lifecycle import (
@@ -107,8 +112,6 @@ from omnigent.util.server_url import ServerUrl
 from omnigent.util.server_url import org_id_from_url as _org_id_from_url
 
 if TYPE_CHECKING:
-    import socket
-
     import httpx
 
     from omnigent.install_ledger import InstallLedger
@@ -642,7 +645,7 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
     }
 )
-_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({"session_title_instructions"})
+_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({"server", "session_title_instructions"})
 _BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset({_AUTO_OPEN_CONVERSATION_CONFIG_KEY})
 _CONFIG_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _CONFIG_FALSE_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
@@ -671,22 +674,6 @@ _DAEMON_RECONNECT_GRACE_S = 5.0
 # bringing its tunnel up. Avoids racing/thrashing sibling invocations.
 _DAEMON_REUSE_MIN_AGE_S = 6.0
 
-# How long uvicorn waits for active connections (WebSocket, SSE) after
-# SIGTERM before force-closing them.  SSE streams signal themselves via
-# session_stream.shutdown_all() in _ShutdownSignalingServer.shutdown(),
-# so the main remaining consumers of this window are WebSocket tunnels
-# that need a moment to drain.  5 s is enough for a clean tunnel teardown
-# while keeping Ctrl-C feeling instant.
-# Overridable via OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S for deployments that
-# need a longer drain window (e.g. large file uploads).
-_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT = 5
-_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S = int(
-    os.environ.get(
-        "OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S",
-        str(_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT),
-    )
-)
-
 _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
         "ANTHROPIC_API_KEY",
@@ -710,6 +697,7 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "COHERE_API_KEY",
         "DEEPSEEK_API_KEY",
         "GEMINI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
         "GOOGLE_API_KEY",
         "GROQ_API_KEY",
         "MISTRAL_API_KEY",
@@ -838,18 +826,13 @@ def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     """
     Merge global and project-level config.
 
-    Precedence (highest last): global (``~/.omnigent/config.yaml``)
-    → local (``.omnigent/config.yaml`` in cwd).  Project config
-    always wins so per-repo settings override user defaults.
-
-    The ``harness`` mapping is deep-merged (per-harness sub-keys, local
-    winning per-field) via :func:`omnigent.config._merge_effective_config`
-    so a project's per-harness overrides augment — rather than replace —
-    the user's global ones. Every other key is a shallow replace.
+    Project defaults override user defaults, except harness executables and
+    arguments, which remain user-owned. Projects may select the default harness.
+    :func:`omnigent.config._merge_effective_config` applies this boundary.
 
     :returns: Merged config dict.
     """
-    return _merge_effective_config(_load_global_config(), _load_local_config())
+    return resolve_effective_config(_load_global_config(), _load_local_config()).config
 
 
 def _peek_default_agent_harness(target: str) -> str | None:
@@ -1650,8 +1633,8 @@ def _validate_agent_policy_functions(  # type: ignore[explicit-any]  # spec type
 
     Walks the root spec and all sub-agents. For each function policy
     it resolves ``function.path`` with the same importer the runtime
-    uses at evaluation time (``_resolve_dotted_path``) — resolution
-    behavior is unchanged; this only surfaces a failure early. The
+    uses at evaluation time (``_resolve_dotted_path``). The callable
+    must be installed in the CLI environment as well as the runtime. The
     factory (if any) is not invoked; this checks import + attribute
     lookup only.
 
@@ -1681,9 +1664,10 @@ def _validate_agent_policy_functions(  # type: ignore[explicit-any]  # spec type
                     f"--agent {agent_source}: agent {current.name!r} policy "
                     f"{policy.name!r} references function {path!r}, which "
                     f"cannot be resolved from sys.path "
-                    f"({type(exc).__name__}: {exc}). Every message on this "
-                    f"agent would be denied; ship the module on the server's "
-                    f"sys.path or fix the policy path.",
+                    f"({type(exc).__name__}: {exc}). Install the trusted callable "
+                    f"package in both the Omnigent CLI and server/runtime environments, "
+                    f"or correct the policy path. CLI preflight does not import "
+                    f"modules from the workspace directory.",
                 ) from exc
 
 
@@ -2244,14 +2228,6 @@ def main() -> None:
     shape (``omnigent [--flags] [prompt]``) is rejected here so it
     cannot fall back to the legacy in-process runner path.
 
-    Also inserts the current working directory at ``sys.path[0]``
-    so dotted callables declared in user YAMLs (``callable:
-    mypackage.mymodule.my_fn``) resolve against the user's project,
-    not the console-script's install directory. Console entry
-    points put the script's own directory at sys.path[0] by
-    default, which is almost never what a CLI that imports
-    user-authored modules wants.
-
     Sets up the always-on CLI diagnostics log before Click dispatch
     so unhandled exceptions are captured even when the user didn't
     enable ``--log`` or ``--debug-events``.
@@ -2270,10 +2246,6 @@ def main() -> None:
     # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
     # to pass through. Refuse naked calls before any work happens.
     _enforce_wrapper_guard()
-
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
 
     # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
     # can't encode the CLI's glyphs; harden the streams before any command
@@ -4727,39 +4699,10 @@ def server(
         # sig mismatch.
         register_local_server(port)
 
-    class _ShutdownSignalingServer(uvicorn.server.Server):
-        """uvicorn.Server that signals active SSE subscribers before the
-        graceful-shutdown wait starts.
-
-        uvicorn calls ``Server.shutdown()`` in this order:
-          1. close listening sockets / call connection.shutdown()
-          2. ``asyncio.wait_for(_wait_tasks_to_complete(), timeout=…)``
-          3. force-cancel remaining tasks on timeout
-          4. run the ASGI lifespan shutdown handler
-
-        The ASGI lifespan ``finally`` block runs at step 4 — too late. SSE
-        generators waiting on a heartbeat tick are already force-cancelled by
-        step 3, which produces spurious ``CancelledError`` tracebacks.
-        Overriding here lets us drain SSE streams before step 2 so they exit
-        cleanly within the graceful window.
-        """
-
-        async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
-            import asyncio as _asyncio
-
-            from omnigent.runtime import session_stream as _session_stream
-            from omnigent.server import shutdown_state as _shutdown_state
-
-            # The runner tunnels close next; their disconnect handlers must
-            # read that loss as ours, not as the runners dying.
-            _shutdown_state.mark_server_shutting_down()
-            _session_stream.shutdown_all()
-            # Yield so streams consume _DONE and exit before transports close.
-            # No [DONE] reaches browsers: they must reconnect after restart.
-            # Without this pause the generators write to an already-closing
-            # transport, leaving connections open past the graceful window.
-            await _asyncio.sleep(0)
-            await super().shutdown(sockets)
+    from omnigent.server.graceful_shutdown import (
+        SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        ShutdownSignalingServer,
+    )
 
     _config = uvicorn.Config(
         app,
@@ -4785,10 +4728,10 @@ def server(
         # change. The tunnels are the sockets that actually need the looser
         # budget (issue #1116).
         **uvicorn_tunnel_kwargs(),
-        timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     )
     try:
-        _ShutdownSignalingServer(_config).run()
+        ShutdownSignalingServer(_config).run()
     except KeyboardInterrupt:
         # uvicorn.run() swallows KeyboardInterrupt; match that behaviour so
         # a Ctrl-C exit doesn't print Click's "Aborted!" or exit non-zero.
@@ -6051,20 +5994,96 @@ def _bundle(source: Path) -> bytes:
     resolved = _resolve_bundle_env_vars(source)
 
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for file_path in source.rglob("*"):
-            if file_path.is_file():
-                arcname = str(file_path.relative_to(source))
-                if arcname in resolved:
-                    # Write the resolved YAML instead of the
-                    # original file (which has ${VAR} refs).
-                    data = resolved[arcname].encode("utf-8")
-                    info = tarfile.TarInfo(name=arcname)
-                    info.size = len(data)
-                    tf.addfile(info, io.BytesIO(data))
-                else:
-                    tf.add(str(file_path), arcname=arcname)
+    # dereference: linked paths can share an inode, and the server refuses hardlink members.
+    with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as tf:
+        for file_path, arcname in _bundle_files(source):
+            if arcname in resolved:
+                # Write the resolved YAML instead of the
+                # original file (which has ${VAR} refs).
+                data = resolved[arcname].encode("utf-8")
+                info = tarfile.TarInfo(name=arcname)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            else:
+                tf.add(str(file_path), arcname=arcname)
     return buf.getvalue()
+
+
+def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
+    """
+    Yield ``(real_path, arcname)`` for every file in an agent directory.
+
+    Symlinks are followed and bundled as regular files, since the server
+    refuses links, so shared skills can be linked into ``skills/``. A link must
+    resolve inside the enclosing Git checkout (or *source* outside one); dangling,
+    escaping and looping links fail instead of silently dropping content, as do
+    links into the repository's ``.git`` directory and unreadable directories.
+    Entries that are not regular files (FIFOs, sockets, devices) are skipped as before.
+
+    :param source: The agent image directory.
+    :raises OmnigentError: If a symlink is dangling, loops, or resolves outside
+        the allowed root.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime.filesystem_registry import detect_git_root
+
+    def resolve(path: Path) -> Path:
+        rel = path.relative_to(source)
+        try:
+            return path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            # Python 3.12 reports loops as RuntimeError; 3.13+ as OSError(ELOOP).
+            if isinstance(exc, RuntimeError) or exc.errno == errno.ELOOP:
+                reason = "is a symlink loop"
+            elif exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                reason = "is a dangling symlink"
+            else:
+                reason = f"cannot be resolved ({exc.strerror})"
+            raise OmnigentError(
+                f"{rel} {reason}; cannot bundle it.", code=ErrorCode.INVALID_INPUT
+            ) from exc
+
+    def unreadable(exc: OSError) -> None:
+        raise OmnigentError(
+            f"{exc.filename} cannot be read ({exc.strerror}); cannot bundle it.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+    root = source.resolve()
+    boundary = detect_git_root(root) or root
+    # Links must not pull in repository metadata such as remote URLs with credentials.
+    git_dir = boundary / ".git"
+    # Real directories on the walk's path to each visited directory, itself included.
+    lineage: dict[str, tuple[Path, ...]] = {}
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=True, onerror=unreadable):
+        current = Path(dirpath)
+        real_dir = resolve(current)
+        ancestors = lineage.get(os.path.dirname(dirpath), ()) if current != source else ()
+        if real_dir in ancestors:
+            raise OmnigentError(
+                f"{current.relative_to(source)} is a symlink loop; cannot bundle it.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        lineage[dirpath] = (*ancestors, real_dir)
+        dirnames.sort()
+        files = set(filenames)
+        for name in [*dirnames, *sorted(files)]:
+            path = current / name
+            real = resolve(path)
+            rel = path.relative_to(source)
+            if real != root / rel and not real.is_relative_to(boundary):
+                raise OmnigentError(
+                    f"{rel} resolves to {real}, outside {boundary}; "
+                    "only symlinks within the agent's checkout can be bundled.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if real != root / rel and real.is_relative_to(git_dir):
+                raise OmnigentError(
+                    f"{rel} resolves into the repository's .git directory; cannot bundle it.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if name in files and real.is_file():
+                yield real, str(rel)
 
 
 def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
@@ -8610,8 +8629,8 @@ def run(
     if smart_routing:
         raise click.ClickException(_run_smart_routing_removed())
     # Apply config defaults for any value the user did not pass explicitly.
-    # Explicit CLI args always take precedence; project-local config overrides
-    # global config, which provides user-level defaults.
+    # Explicit CLI args always take precedence; project defaults override
+    # user defaults except for user-owned harness launch settings.
     server_source = click.get_current_context().get_parameter_source("server")
     server_from_cli = server_source is not None and server_source.name == "COMMANDLINE"
     # ``--server local`` (or ``--server ""``) is the documented "ignore any
@@ -10925,7 +10944,7 @@ def _harness_deep_merge_keys(
 
 
 def _validate_config_set_scope(settings: Mapping[str, object], *, is_global: bool) -> None:
-    """Reject project-local writes for settings owned by the shared server."""
+    """Reject project-local writes for user-owned server settings."""
     if is_global:
         return
     user_only = sorted(settings.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
@@ -10933,7 +10952,7 @@ def _validate_config_set_scope(settings: Mapping[str, object], *, is_global: boo
         names = ", ".join(repr(key) for key in user_only)
         raise click.ClickException(
             f"Config key(s) {names} can only be set with --global because they "
-            "configure the shared local server."
+            "configure user-level server behavior."
         )
 
 
@@ -11026,7 +11045,8 @@ def _print_config_defaults() -> None:
     """Print the effective CLI defaults (user + project-level).
 
     The ``KEY=VALUE`` defaults from ``~/.omnigent/config.yaml`` (user) and
-    ``.omnigent/config.yaml`` in the cwd (project, takes precedence).
+    ``.omnigent/config.yaml`` in the cwd (project defaults). Harness launch
+    overrides are user-owned; project configuration can select the default.
     Used by ``omnigent config list``.
 
     :returns: None. Side effect: writes to stdout.
@@ -11042,12 +11062,15 @@ def _print_config_defaults() -> None:
     ignored_local_keys = (
         [] if local_is_global else sorted(raw_local_cfg.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
     )
+    ignored_harness_keys = [] if local_is_global else _ignored_project_harness_keys(raw_local_cfg)
     local_cfg = {
         k: v
         for k, v in raw_local_cfg.items()
         if local_is_global or k not in _USER_LEVEL_ONLY_CONFIG_KEYS
     }
-    if not global_cfg and not local_cfg and not ignored_local_keys:
+    if not local_is_global:
+        local_cfg = _merge_effective_config({}, local_cfg)
+    if not global_cfg and not local_cfg and not ignored_local_keys and not ignored_harness_keys:
         click.echo(
             f"  (none set — `{cli_invocation()} config set key=value` for project,\n"
             f"   or `{cli_invocation()} config set --global key=value` for user-level)"
@@ -11070,6 +11093,11 @@ def _print_config_defaults() -> None:
         click.echo(
             "  # ignored user-level-only setting(s): "
             f"{', '.join(ignored_local_keys)} (set with --global)"
+        )
+    if ignored_harness_keys:
+        click.echo(
+            f"  # ignored project harness launch overrides: {', '.join(ignored_harness_keys)} "
+            f"(move to {_display_config_path(global_path)})"
         )
 
 
@@ -11149,7 +11177,7 @@ def _slack_installed() -> bool:
 
 def _slack_argv() -> list[str]:
     """Argv that runs the Slack bot in the current interpreter."""
-    return [sys.executable, "-m", _SLACK_PACKAGE]
+    return [sys.executable, "-P", "-m", _SLACK_PACKAGE]
 
 
 def _integration_state_dir() -> Path:
@@ -11366,11 +11394,13 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     Without ``--global``, pairs are written to ``.omnigent/config.yaml``
     in the current directory (project-level, like ``.git/config``); with
     ``--global`` to ``~/.omnigent/config.yaml`` (user-level, like
-    ``~/.gitconfig``). Project values take precedence.
+    ``~/.gitconfig``). Project defaults take precedence except for harness
+    executables and arguments, which are user-owned.
 
     Supported keys: auto_open_conversation, default_agent, harness,
-    model, server, session_title_instructions. Session title instructions
-    configure the shared local server and require ``--global``.
+    model, server, session_title_instructions. Server selection and session
+    title instructions require ``--global``. A project-local ``server`` is
+    ignored; use ``--server`` for a per-invocation destination.
 
     :param is_global: When ``True``, write to ``~/.omnigent/config.yaml``;
         when ``False``, to ``.omnigent/config.yaml`` in cwd.
@@ -11814,7 +11844,9 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
             _clone_github_source(clone_url, ref, checkout)
         except click.ClickException as exc:
             if not source.startswith(("github:", "https://")):
-                exc.message += f"\n(If {source!r} is a local path, it doesn't exist.)"
+                raise _agent_cli_error(
+                    f"{exc.message}\n(If {source!r} is a local path, it doesn't exist.)"
+                ) from None
             raise
         # The parser rejects `..`, so only a symlinked component can leave the subpath.
         root = checkout / subpath
@@ -12627,6 +12659,8 @@ def _resolve_server_url(server: str) -> ServerUrl:
     org_id = _org_id_from_url(server)
 
     def _resolved(api_base: str) -> ServerUrl:
+        from omnigent.debug_logging import publish_origin_identity
+
         if org_id is not None:
             resolved = ServerUrl(api_base=api_base, org_id=org_id)
             if resolved.is_workspace_hosted:
@@ -12639,8 +12673,12 @@ def _resolve_server_url(server: str) -> ServerUrl:
                         "Could not persist the workspace routing selector. "
                         "Check that the Omnigent data directory is writable, then retry."
                     ) from exc
-            return resolved
-        return ServerUrl.from_api_base(api_base)
+        else:
+            resolved = ServerUrl.from_api_base(api_base)
+        # Every remote CLI command resolves its server here, so this attributes
+        # the CLI's own debug-log rows.
+        publish_origin_identity(resolved.api_base)
+        return resolved
 
     # A URL copied from the browser while a conversation is open carries the
     # SPA's ``/c/<id>`` route. The SPA catch-all answers any GET under it with
@@ -12986,10 +13024,14 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     """
     databricks_bin = shutil.which("databricks")
     if databricks_bin is None:
-        raise click.ClickException(
-            "The Databricks CLI is required to log in to a workspace. "
-            "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
+        from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+        exc = click.ClickException(
+            "Databricks CLI not found on PATH. Install it, then retry this command.\n"
+            "https://docs.databricks.com/dev-tools/cli/install.html"
         )
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise exc
     login_host = _host_with_org(workspace_host, org_id)
     # Pin the grant to a profile named for the workspace's first DNS label so
     # distinct workspaces don't clobber each other under the CLI's ``DEFAULT``.
@@ -13217,14 +13259,38 @@ def login(server_url: str) -> None:
     from omnigent.cli_auth import store_token
 
     # Step 1: Request a CLI login ticket.
+    code_verifier = secrets.token_urlsafe(48)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
     try:
         resp = _httpx.post(
-            f"{server}/auth/cli-login", timeout=10.0, trust_env=_trust_env_for(server)
+            f"{server}/auth/cli-login",
+            json={"code_challenge": code_challenge, "code_challenge_method": "S256"},
+            timeout=10.0,
+            trust_env=_trust_env_for(server),
         )
-        resp.raise_for_status()
     except _httpx.HTTPError as exc:
         raise click.ClickException(
             f"Could not reach {server}/auth/cli-login: {exc}\n"
+            f"Is the server running with OMNIGENT_AUTH_PROVIDER=oidc?"
+            f"{_proxy_interference_hint(server)}"
+        ) from exc
+    if resp.status_code == 400:
+        try:
+            error = resp.json().get("error")
+        except (ValueError, AttributeError):
+            error = None
+        raise click.ClickException(
+            error if isinstance(error, str) else "Could not start CLI login."
+        )
+    try:
+        resp.raise_for_status()
+    except _httpx.HTTPError as exc:
+        raise click.ClickException(
+            f"Could not start CLI login: {exc}\n"
             f"Is the server running with OMNIGENT_AUTH_PROVIDER=oidc?"
             f"{_proxy_interference_hint(server)}"
         ) from exc
@@ -13235,18 +13301,26 @@ def login(server_url: str) -> None:
 
     # Step 2: Open the browser.
     click.echo(f"Opening browser for login: {login_url}")
+    if data.get("user_code"):
+        click.echo(f"Confirm this code in the browser: {data['user_code']}")
     click.echo("Waiting for authentication...")
     webbrowser.open(login_url)
 
     # Step 3: Poll until the ticket is fulfilled or expired.
-    poll_url = f"{server}/auth/cli-poll?ticket={ticket}"
+    poll_url = f"{server}/auth/cli-poll"
     import time as _time
 
     deadline = _time.time() + _CLI_LOGIN_TIMEOUT_SECONDS
     while _time.time() < deadline:
         _time.sleep(2)
         try:
-            poll_resp = _httpx.get(poll_url, timeout=10.0, trust_env=_trust_env_for(server))
+            poll_resp = _httpx.get(
+                poll_url,
+                params={"ticket": ticket},
+                headers={"X-Omnigent-Code-Verifier": code_verifier},
+                timeout=10.0,
+                trust_env=_trust_env_for(server),
+            )
         except _httpx.HTTPError:
             continue
 
@@ -13270,7 +13344,16 @@ def login(server_url: str) -> None:
             click.echo(f"Logged in as {user_id}")
             _remember_default_server(server)
             return
-        # 410 or other error — ticket expired.
+        if poll_resp.status_code in (400, 403, 410):
+            try:
+                error = poll_resp.json().get("error")
+            except (ValueError, AttributeError):
+                error = None
+            raise click.ClickException(
+                error
+                if isinstance(error, str)
+                else "Login ticket expired or was rejected. Please try again."
+            )
         raise click.ClickException("Login ticket expired or was rejected. Please try again.")
 
     raise click.ClickException(
@@ -13924,6 +14007,24 @@ def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
         )
 
 
+def _reject_reserved_codex_transport_args(codex_args: tuple[str, ...]) -> None:
+    """Reject Codex transport args that the runner owns in passthrough args.
+
+    The runner starts Codex's app-server and attaches the TUI itself, so a
+    session created with ``app-server``/``--listen``/``--remote`` could only
+    fail at terminal start.
+    """
+    from omnigent.harnesses.codex_native.launch_args import reserved_codex_transport_arg
+
+    reserved = reserved_codex_transport_arg(codex_args)
+    if reserved is not None:
+        raise click.UsageError(
+            f"{reserved!r} is reserved for Omnigent, which starts Codex's app-server "
+            f"and attaches the TUI itself. Drop it from `{cli_invocation()} codex`, "
+            "or run `codex app-server` directly for a standalone app-server."
+        )
+
+
 def _build_kiro_launch_args(
     *,
     effort: str | None,
@@ -14012,8 +14113,4 @@ _register_native_commands(cli)
 
 
 if __name__ == "__main__":
-    # Omnigent is already loaded from the selected installation. Restore the
-    # workspace path for local tools, matching the console entry point.
-    if (_cwd := os.getcwd()) not in sys.path:
-        sys.path.insert(0, _cwd)
     cli()

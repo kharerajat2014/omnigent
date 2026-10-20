@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
+from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
@@ -1864,10 +1865,18 @@ async def test_launch_preserves_prompt_and_following_args_real_tmux(
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
-@pytest.mark.parametrize("exit_status", [0, 255])
+@pytest.mark.parametrize("exit_status", [0, 255, -15, -9])
+@pytest.mark.parametrize(
+    ("program_status_app", "close_stdio"),
+    [(None, False), ("claude-code", False), ("claude-code", True)],
+)
 @pytest.mark.asyncio
 async def test_server_survives_inner_process_exit_real_tmux(
-    tmp_path: Path, short_tmp_parent: Path, exit_status: int
+    tmp_path: Path,
+    short_tmp_parent: Path,
+    exit_status: int,
+    program_status_app: str | None,
+    close_stdio: bool,
 ) -> None:
     """
     The private tmux server outlives an inner-process exit (issue #540).
@@ -1882,6 +1891,10 @@ async def test_server_survives_inner_process_exit_real_tmux(
     :param tmp_path: Temporary directory for the real tmux socket.
     """
     exit_signal = tmp_path / "exit-signal"
+    exit_command = f"kill -{-exit_status} $$" if exit_status < 0 else f"exit {exit_status}"
+    if close_stdio:
+        # Force PTY EOF before waitpid can retrieve the final exit status.
+        exit_command = f"exec 0<&- 1>&- 2>&-; sleep 0.05; {exit_command}"
     instance = TerminalInstance(
         name="bash",
         session_key="s1",
@@ -1894,11 +1907,12 @@ async def test_server_survives_inner_process_exit_real_tmux(
             "-c",
             'printf "terminal-final-output\\n"; '
             'while [ ! -e "$1" ]; do sleep 0.02; done; '
-            f"exit {exit_status}",
+            f'printf "terminal-exit-tail\\n"; {exit_command}',
             "sh",
             str(exit_signal),
         ],
         keep_alive_after_exit=True,
+        program_status_app=program_status_app,
     )
     try:
         await instance.launch(cwd=tmp_path)
@@ -1941,11 +1955,19 @@ async def test_server_survives_inner_process_exit_real_tmux(
             f"{probe.stderr.decode().strip()!r}"
         )
         assert instance._pane_is_dead() is True
-        assert instance.last_exit_status() == exit_status
+        assert instance.last_exit_status() == (exit_status if exit_status >= 0 else None), (
+            instance.last_exit_text()
+        )
+        signal_name = instance.last_exit_signal()
+        assert (signal_name.upper().removeprefix("SIG") if signal_name else None) == {
+            -15: "TERM",
+            -9: "KILL",
+        }.get(exit_status)
         final_frame = await instance._tmux_output(
             "capture-pane", "-t", instance.tmux_target, "-p", "-S", "-100"
         )
         assert "terminal-final-output" in final_frame
+        assert "terminal-exit-tail" in final_frame
     finally:
         await instance.close()
 
@@ -2303,11 +2325,15 @@ def test_require_supported_tmux_accepts_minimum_or_newer(
 def test_require_supported_tmux_rejects_missing_binary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Managed terminals retain the existing clear missing-tmux error."""
+    """A missing tmux is a host setup error whose message says how to fix it."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: None)
 
-    with pytest.raises(RuntimeError, match="tmux is not installed or not on PATH"):
+    with pytest.raises(RuntimeError, match="tmux is not installed or not on PATH") as caught:
         terminal_mod._require_supported_tmux()
+
+    assert isinstance(caught.value, terminal_mod.TmuxUnavailableError)
+    assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
+    assert "brew install tmux" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -2326,7 +2352,7 @@ def test_require_supported_tmux_rejects_old_or_unknown_version(
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
     monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(terminal_mod.TmuxUnavailableError, match=message):
         terminal_mod._require_supported_tmux()
 
 
