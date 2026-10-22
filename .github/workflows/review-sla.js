@@ -1,9 +1,9 @@
 // Reviewer SLA sweep: nudge + escalate open PRs and issues that a MAINTAINER has
 // been sitting on for more than SLA_DAYS *working* days without replying.
 //
-// Runs on a schedule from the trusted default branch (see review-sla.yml), so it
-// reads no PR-authored code and just talks to the issues/PRs API. For each open,
-// non-draft item:
+// Runs on manual dispatch only, from the trusted default branch (see
+// review-sla.yml -- there is no `schedule:` trigger), so it reads no PR-authored
+// code and just talks to the issues/PRs API. For each open, non-draft item:
 //   - PRs: the "assigned person" is any maintainer in requested_reviewers (GitHub
 //     drops them from that list the moment they submit a review, so being in it
 //     means "still owes a review"). The clock starts at their latest
