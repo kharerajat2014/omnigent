@@ -30,8 +30,8 @@ entire agent turn.
 
 The executor checks its lease before external actions, attaches the session before
 sending the prompt, and records `running` after delivery. Lease loss stops local
-startup work. Interrupted runs remain recorded for recovery; the scheduler never
-resends a prompt automatically. After an outage it dispatches one overdue
+startup work. Interrupted `starting` runs remain recorded for recovery; the scheduler
+never resends a prompt automatically. After an outage it dispatches one overdue
 occurrence per task, then advances into the future instead of replaying every
 missed occurrence.
 
@@ -50,3 +50,14 @@ The poll awaits this callback, so it must return promptly and respect cancellati
 Defaults are 30-second polls and renewals, 120-second leases, 100 rows per page,
 and 100 concurrent startups per server. `ScheduledTaskSchedulerConfig` validates
 these settings; renewal must occur more frequently than lease expiry.
+
+Constructing the scheduler enables persistent dispatch on its shared store. Do
+this before serving requests, using the application's scheduler mode. Stopping
+the scheduler stops its work but does not switch the store back to legacy mode.
+Call `start()` and `stop()` sequentially, awaiting each before calling the next.
+
+Startup recovery inspects unfinished `starting` runs after their leases expire.
+An executor error after recording `running` does not move the run back into
+startup recovery. Error logs include the last locally recorded run status.
+Unexpected database-write failures are logged even if the caller was cancelled;
+expected lease loss does not produce an extra error traceback.
