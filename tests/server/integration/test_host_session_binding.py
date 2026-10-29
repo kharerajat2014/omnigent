@@ -1917,7 +1917,7 @@ async def test_shutdown_waits_for_an_in_flight_launch_to_bind_its_host(
     from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
     env = managed_session_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     loop = asyncio.get_running_loop()
     gate = threading.Event()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
@@ -1971,7 +1971,7 @@ async def test_shutdown_cancelling_the_bind_write_keeps_the_session_startable(
     from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
     env = managed_session_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "10")
     loop = asyncio.get_running_loop()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
 
