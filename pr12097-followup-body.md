@@ -1,9 +1,18 @@
 ## Related issue
 
-Follow-up to #12097 (which closed #3069), addressing the non-blocking notes
-from Polly's review there. The blocking P1 from that same review — cleanup
-hanging past the install timeout when a child holds stderr — was already fixed
-by @PattaraS in #12185; this builds on that and does not revisit it.
+Closes #ISSUE
+
+Follow-up to #12097, which landed the original fix. This addresses the
+non-blocking notes from Polly's review on that PR. The blocking P1 from the
+same review — cleanup hanging past the install timeout when a child holds
+stderr — was already handled by @PattaraS in #12185; this builds on that and
+does not revisit it.
+
+> An earlier revision of this PR was auto-closed as "linked work is no longer
+> open". That was my doing: this section used to describe #12097 as the PR
+> that had closed issue 3069, and the closing-keyword parser read that phrase
+> as a closing link from *this* PR to an already-completed issue. Reworded
+> without the keyword, and the issue above is the live link.
 
 Three notes were left open. This takes the two substantive ones and the
 wording one:
