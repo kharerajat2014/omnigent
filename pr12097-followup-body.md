@@ -1,6 +1,6 @@
 ## Related issue
 
-Closes #ISSUE
+Closes #12507
 
 Follow-up to #12097, which landed the original fix. This addresses the
 non-blocking notes from Polly's review on that PR. The blocking P1 from the
