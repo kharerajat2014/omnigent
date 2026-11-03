@@ -1,0 +1,3 @@
+@yaoharry, since you've done much of the recent work in these runner and harness-launch files, could you review this? It lets a session carry its own value for an environment variable the agent spec already declares in `env_passthrough`, merged into the per-spawn overrides `_build_harness_spawn_env` already applies. Names the spec doesn't declare are still refused, so it stays deny-by-default.
+
+The use case in #5858 is per-run telemetry attribution (`OTEL_RESOURCE_ATTRIBUTES` per dispatch), which today needs a downstream join layer to work around. All required checks pass and it's mergeable against current `main`.
